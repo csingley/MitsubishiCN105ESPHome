@@ -72,6 +72,12 @@ void CN105Climate::controlDelegate(const esphome::climate::ClimateCall& call) {
     updated = this->processFanChange(call) || updated;
     updated = this->processSwingChange(call) || updated;
 
+    if (updated && this->mode == climate::CLIMATE_MODE_HEAT_COOL && this->dead_band_enabled()) {
+        // Run the HEAT_COOL dead-band once, with the call's mode and band both
+        // applied, so any transition it stages rides this call's packet.
+        this->profile_->update_action();
+    }
+
     this->finalizeControlIfUpdated(updated);
 
     // Persist the (possibly new) mode + band so it can be restored after a reboot.

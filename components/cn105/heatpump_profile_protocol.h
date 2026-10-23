@@ -2,7 +2,9 @@
 #include "cn105_protocol.h"
 #include "cn105_types.h"
 #include "heatpumpFunctions.h"
+#include <algorithm>
 #include <cmath>
+#include <cstring>
 #include "esphome/components/climate/climate_mode.h"
 
 namespace esphome::cn105 {
@@ -27,6 +29,154 @@ struct HeatPumpProtocol {
         if (current < low) return low;
         if (current > high) return high;
         return current;
+    }
+
+    // True if the polled wire state is actually running (power ON) in the
+    // given mode ("HEAT"/"COOL") right now. Pure observation of
+    // currentSettings -- never of this->mode, which can disagree with the
+    // wire by design while the HEAT_COOL dead-band is driving it directly.
+    static bool compressor_running_as(const heatpumpSettings& settings, const char* mode) {
+        return settings.power != nullptr && std::strcmp(settings.power, "ON") == 0 &&
+               settings.mode != nullptr && std::strcmp(settings.mode, mode) == 0;
+    }
+
+    // Decision math for the HEAT_COOL dead-band (update_action()'s
+    // CLIMATE_MODE_HEAT_COOL case) -- pure function, no side effects, so
+    // it's directly testable the same way deadband_setting() above is.
+    // `dwell_ok`/`allow_heat`/`allow_cool` are already-resolved booleans;
+    // this function doesn't know about millis(), min_dwell_s_, or where
+    // the veto came from. `foreign_running`: powered on in a mode the
+    // dead-band doesn't drive (e.g. hardware AUTO left over from before
+    // HEAT_COOL was entered) -- idled like a running direction would be.
+    enum class DeadBandAction { ENTER_HEAT, ENTER_COOL, HOLD_HEATING, HOLD_COOLING, GO_IDLE, STAY_IDLE };
+
+    // Hysteresis actually applied: capped at half the band so the heat and
+    // cool exit points can't cross.
+    static float dead_band_hysteresis(float low, float high, float hysteresis) {
+        if (std::isnan(hysteresis) || hysteresis <= 0.0f) return 0.0f;
+        const float half_band = (high - low) / 2.0f;
+        return half_band > 0.0f && hysteresis > half_band ? half_band : hysteresis;
+    }
+
+    // Setpoint sent with ENTER_HEAT/ENTER_COOL: the first 0.5 °C step at which
+    // the dead-band idles again, so the unit's own thermostat doesn't satisfy
+    // itself short of that point. Kept inside the band.
+    static float dead_band_entry_setpoint(bool heat, float low, float high, float hysteresis) {
+        const float h = dead_band_hysteresis(low, high, hysteresis);
+        if (heat) return std::min(low + h + 0.5f, high);
+        return std::max(high - h - 0.5f, low);
+    }
+
+    // Setpoint sent on GO_IDLE for a known running direction: lets the
+    // unit's own thermostat settle into native thermo-off (compressor
+    // idles, fan behavior per the unit's own ISU 125/127 settings) instead
+    // of a power-off. Deliberately 0.5 C past the current reading, not
+    // merely equal to it -- hardware's own comparison can read current
+    // temperature slightly differently than ours (a different sensor
+    // source, or coarser rounding), so an exactly-equal setpoint isn't
+    // reliably "satisfied" to the unit itself. Verified on real hardware
+    // (2026-10-23, docs/surveys/hardware-auto-mode.md): an equal setpoint
+    // left the compressor running; -0.5/+0.5 reliably idled it.
+    static float dead_band_idle_setpoint(bool heat, float current) {
+        return heat ? current - 0.5f : current + 0.5f;
+    }
+
+    static DeadBandAction dead_band_decision(float current, float low, float high,
+                                              bool heating, bool cooling,
+                                              bool dwell_ok, bool allow_heat, bool allow_cool,
+                                              bool foreign_running = false, float hysteresis = 0.0f) {
+        if (std::isnan(current)) {
+            // No reading yet -- never act blind. Report truthfully (whichever
+            // direction is actually running, or idle), but never COMMAND
+            // anything from here: unlike the comparisons below, a NaN
+            // reading can't legitimately justify entering OR exiting.
+            if (heating) return DeadBandAction::HOLD_HEATING;
+            if (cooling) return DeadBandAction::HOLD_COOLING;
+            return DeadBandAction::STAY_IDLE;
+        }
+        if (current >= high && (cooling || (dwell_ok && allow_cool))) {
+            return cooling ? DeadBandAction::HOLD_COOLING : DeadBandAction::ENTER_COOL;
+        }
+        if (current <= low && (heating || (dwell_ok && allow_heat))) {
+            return heating ? DeadBandAction::HOLD_HEATING : DeadBandAction::ENTER_HEAT;
+        }
+        // Hysteresis: a running direction carries on while the room is within
+        // h of its edge, and idles once it's further in. Inclusive, so with
+        // 0.5 °C readings h = 0.5 means one extra step. No effect at h == 0.
+        const float h = dead_band_hysteresis(low, high, hysteresis);
+        constexpr float EPS = 0.01f;
+        if (h > 0.0f && heating && current <= low + h + EPS) return DeadBandAction::HOLD_HEATING;
+        if (h > 0.0f && cooling && current >= high - h - EPS) return DeadBandAction::HOLD_COOLING;
+        if (!heating && !cooling) {
+            return (foreign_running && dwell_ok) ? DeadBandAction::GO_IDLE : DeadBandAction::STAY_IDLE;
+        }
+        if (dwell_ok) return DeadBandAction::GO_IDLE;
+        // Held on past the dead-band edge by dwell -- still actually
+        // heating/cooling, so say so rather than claiming an idle that
+        // hasn't happened yet.
+        return heating ? DeadBandAction::HOLD_HEATING : DeadBandAction::HOLD_COOLING;
+    }
+
+    // Whether the dead-band owns the unit being off/idle after this decision
+    // (see resolve_mode()'s hold_power_off). `power_staged`: a power command
+    // of ours was already waiting to be sent before this decision.
+    // `idling_on`: dead_band_idling_'s value going into this decision --
+    // true while the dead-band is holding a known direction idle via a
+    // satisfied setpoint (power stays ON), as opposed to a genuine
+    // power-off state. Needed because STAY_IDLE alone can mean either: a
+    // real power-off report from this state would only ever be the user's
+    // doing while idling_on is true (the dead-band never commands OFF from
+    // there), so ownership must not be claimed in that case -- unlike the
+    // true power-off idle state (e.g. at boot, before anything's ever been
+    // commanded), where a power-off report is the dead-band's own normal
+    // resting state and must still be held.
+    static bool dead_band_owns_off_after(bool owns, DeadBandAction action, bool heating, bool cooling,
+                                         bool foreign_running, bool power_staged, bool idling_on = false) {
+        // Running with nothing of ours staged: someone else turned it on, so
+        // a later power-off is theirs to make.
+        if ((heating || cooling || foreign_running) && !power_staged) owns = false;
+        switch (action) {
+        case DeadBandAction::ENTER_HEAT:
+        case DeadBandAction::ENTER_COOL: return false;
+        // A known running direction idles via a satisfied setpoint, staying
+        // powered on (see update_action()) -- no power-off event of ours to
+        // protect. Only the foreign_running fallback (no known direction;
+        // still forced OFF) keeps ownership of the resulting power-off
+        // report, same as before.
+        case DeadBandAction::GO_IDLE: return !(heating || cooling);
+        case DeadBandAction::STAY_IDLE: return idling_on ? false : (foreign_running ? owns : true);
+        default: return owns;
+        }
+    }
+
+    // Queue staged wantedSettings for sending. loop() only sends when
+    // hasChanged is set; a ClimateCall sets it in finalizeControlIfUpdated(),
+    // anything staged outside one must set it here or it never goes out.
+    static void mark_staged(wantedHeatpumpSettings& wanted, long now) {
+        wanted.hasChanged = true;
+        wanted.hasBeenSent = false;
+        wanted.lastChange = now;
+    }
+
+    // Decision math for the absolute safety clamp (update_action(), checked
+    // before everything else) -- pure function, same testability rationale
+    // as dead_band_decision() above.
+    enum class SafetyClampAction { NONE, ENTER_HEAT, HOLD_HEATING, ENTER_COOL, HOLD_COOLING, HOLD_IDLE };
+    static SafetyClampAction safety_clamp_decision(float current, float floor_c, float ceiling_c,
+                                                     bool already_heating, bool already_cooling,
+                                                     bool dwell_ok) {
+        if (std::isnan(current)) return SafetyClampAction::NONE;   // no reading yet, don't act blind
+        if (!std::isnan(floor_c) && current < floor_c) {
+            if (already_heating) return SafetyClampAction::HOLD_HEATING;
+            if (dwell_ok) return SafetyClampAction::ENTER_HEAT;
+            return already_cooling ? SafetyClampAction::HOLD_COOLING : SafetyClampAction::HOLD_IDLE;
+        }
+        if (!std::isnan(ceiling_c) && current > ceiling_c) {
+            if (already_cooling) return SafetyClampAction::HOLD_COOLING;
+            if (dwell_ok) return SafetyClampAction::ENTER_COOL;
+            return already_heating ? SafetyClampAction::HOLD_HEATING : SafetyClampAction::HOLD_IDLE;
+        }
+        return SafetyClampAction::NONE;
     }
     template<typename Targets>
     static void reconcile_target_temperatures(Targets& targets, climate::ClimateMode mode, bool two_point, float temperature) {
@@ -190,10 +340,17 @@ struct HeatPumpProtocol {
             cn105_protocol::encode_remote_temperature(temperature, packet[7], packet[8]);
         } else packet[8] = 0x80;
     }
+    // hold_power_off: the HEAT_COOL dead-band itself chose to leave the unit
+    // off/idle, so a power-off report is its own doing, not a user turning
+    // the unit off -- keep HEAT_COOL instead of dropping to OFF.
     static climate::ClimateMode resolve_mode(const char* power, const char* reported,
-                                             climate::ClimateMode mode, bool supports_dual) {
+                                             climate::ClimateMode mode, bool supports_dual,
+                                             bool hold_power_off = false) {
         if (power == nullptr) return mode;
-        if (std::strcmp(power, "ON") != 0) return climate::CLIMATE_MODE_OFF;
+        if (std::strcmp(power, "ON") != 0) {
+            const bool hold = hold_power_off && supports_dual && mode == climate::CLIMATE_MODE_HEAT_COOL;
+            return hold ? mode : climate::CLIMATE_MODE_OFF;
+        }
         if (reported == nullptr) return mode;
         const bool hold = supports_dual && mode == climate::CLIMATE_MODE_HEAT_COOL;
         if (std::strcmp(reported, "HEAT") == 0) return hold ? mode : climate::CLIMATE_MODE_HEAT;
@@ -205,7 +362,8 @@ struct HeatPumpProtocol {
         return mode;
     }
     static climate::ClimateMode reconcile_power_mode(const heatpumpSettings& settings, heatpumpSettings& current,
-                                                      climate::ClimateMode mode, bool supports_dual, bool update_current) {
+                                                      climate::ClimateMode mode, bool supports_dual, bool update_current,
+                                                      bool hold_power_off = false) {
         const auto changed = [](const char* value, const char* previous) {
             return value != nullptr && (previous == nullptr || std::strcmp(value, previous) != 0);
         };
@@ -214,7 +372,7 @@ struct HeatPumpProtocol {
             if (settings.power != nullptr) current.power = settings.power;
             if (settings.mode != nullptr) current.mode = settings.mode;
         }
-        return update ? resolve_mode(settings.power, settings.mode, mode, supports_dual) : mode;
+        return update ? resolve_mode(settings.power, settings.mode, mode, supports_dual, hold_power_off) : mode;
     }
     static uint8_t compressor_frequency(const uint8_t* data, bool report_when_idle) {
         return report_when_idle || data[4] > 0 ? data[3] : 0;

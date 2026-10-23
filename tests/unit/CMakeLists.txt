@@ -42,6 +42,7 @@ add_executable(cn105_tests
     test_protocol.cpp
     test_localization.cpp
     test_dual_setpoint_recenter.cpp
+    test_dead_band_actuation.cpp
     test_setpoint_persistence.cpp
     test_mode_preservation.cpp
     test_vane_setpoint_persistence.cpp

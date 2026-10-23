@@ -49,6 +49,9 @@ class HeatPumpProfile final : public Cn105ProtocolProfile {
 
  private:
     void debug_functions(const uint8_t* packet, unsigned int length);
+    // Stage a dead-band/safety-clamp wire command (mode may be nullptr for
+    // power-only) and mark it for sending; false if actuation is suppressed.
+    bool stage_transition_(const char* mode, const char* power, float setpoint, uint32_t now_ms);
     bool use_temperature_encoding_b_ = false;
     bool use_temperature_encoding_b_latched_ = false;
     bool wide_vane_adjust_ = false;

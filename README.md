@@ -338,8 +338,25 @@ climate:
       # Explicitly control dual setpoint support in the UI/traits
       # Defaults to false when omitted
       dual_setpoint: true
+      # Persist the HEAT_COOL band to flash and restore it on boot
+      # Defaults to false when omitted
+      restore_setpoints: true
+      # Drive HEAT_COOL with the on-device dead-band instead of hardware AUTO
+      # (requires dual_setpoint). Defaults to false when omitted.
+      dead_band_actuation: true
+      # Once heating/cooling, carry on this far (°C) into the band before
+      # idling (requires dead_band_actuation). Defaults to 0 when omitted.
+      band_hysteresis_c: 0.5
+      # Minimum seconds between dead-band-driven mode/power transitions
+      # (anti-short-cycle). Defaults to 0 (disabled) when omitted.
+      min_dwell_s: 300
+      # Absolute freeze/overheat clamp (°C), checked before everything
+      # else and overriding an explicit OFF. Each independently disabled
+      # when omitted -- see "Dual setpoint actuation" below.
+      safety_floor_c: 10.0
+      safety_ceiling_c: 32.0
       # You can still specify supported modes as before
-      mode: [AUTO, COOL, HEAT, DRY, FAN_ONLY]
+      mode: [AUTO, COOL, HEAT, HEAT_COOL, DRY, FAN_ONLY]
       fan_mode: [AUTO, QUIET, LOW, MEDIUM, HIGH]
       swing_mode: ["OFF", VERTICAL]
       # Specify which options to display in horizontal_vane_select dropdown
@@ -347,6 +364,68 @@ climate:
       # Example to hide "←→" and "AIRFLOW CONTROL" if not supported by your unit:
       horizontal_vane_mode: ["←←", "←", "|", "→", "→→", SWING]
 ```
+
+#### Dual setpoint actuation
+
+Setting `dual_setpoint: true` alone only changes the HA-facing trait and
+(with `restore_setpoints: true`) flash persistence of the
+`{mode, low, high}` triple -- the unit still only understands a single wire
+setpoint, so without more, selecting `HEAT_COOL` just sends hardware `AUTO`
+with whichever single value the deadband math (`deadband_setting()`)
+happens to compute at the moment you change a setpoint. It does not keep
+re-evaluating as the room drifts.
+
+With `dead_band_actuation: true` (requires `dual_setpoint: true`), `HEAT_COOL`
+is instead driven by an on-device dead-band (`update_action()`) that compares
+live temperature against `target_temperature_low`/`target_temperature_high`
+and commands the real wire mode directly (HEAT or COOL) -- never hardware
+`AUTO`. It re-evaluates on every status/settings change reported by the unit
+(including room temperature) and on every command in this mode, and queues
+anything it decides for immediate sending. `this->mode` stays `HEAT_COOL` for
+display the whole time, including while the dead-band has the unit idle;
+only the polled wire state changes. A power-off you make yourself (remote or
+HA) while it's running still switches the mode to OFF. Without
+`dead_band_actuation`, `HEAT_COOL` behaves as before (hardware `AUTO`).
+
+When the band is satisfied after actively heating or cooling, the dead-band
+idles by pushing a setpoint the unit's own thermostat already considers met
+-- mode and power are left exactly as they were, so the unit settles into
+its own native thermo-off (compressor idles; fan behavior then follows
+whatever the unit's own ISU installer settings say for that state) rather
+than a harder power cycle. Verified on real hardware
+(`docs/surveys/hardware-auto-mode.md`). The one exception: idling a unit left
+running in a mode the dead-band doesn't drive at all (e.g. hardware `AUTO`
+left over from before `HEAT_COOL` was entered) has no direction of its own to
+idle into, so that case still falls back to a real power-off.
+
+- **`band_hysteresis_c`**: once the dead-band is heating, it keeps heating
+  while the room is within this value of the low edge, and idles once it's
+  further in (cooling: likewise from the high edge). So a room sitting on a
+  band edge doesn't flip heat/idle every time `min_dwell_s` allows. With
+  the unit's 0.5 °C readings, 0.5 means one extra step: heat at 20.0, keep
+  going at 20.5, idle at 21.0. Capped at half the band width. Either way, the
+  setpoint sent when heating/cooling starts is the first 0.5 °C step at which
+  the dead-band idles again, so the unit's own thermostat doesn't stop short
+  of it.
+- **`min_dwell_s`**: minimum time between mode-flipping actuations. The
+  compressor doesn't care why a flip was requested, so this also gates the
+  safety clamp below -- an emergency call is held off by the same window as
+  an ordinary comfort one. Continuing or correcting whichever direction is
+  already running is never gated by dwell.
+- **`safety_floor_c`/`safety_ceiling_c`**: an absolute freeze/overheat
+  clamp, checked before anything else, every cycle. **This can turn the
+  unit on against an explicit `OFF` command** -- that's deliberate (the
+  same reasoning as any thermostat's own frost-protection feature), not an
+  oversight, so don't set these unless you want that override.
+- Cross-zone/multi-unit installs sharing one outdoor condenser can further
+  veto the dead-band's entry into a new direction at runtime, via
+  `id(<climate_id>).set_allow_heat(bool)` / `set_allow_cool(bool)` from a
+  lambda -- e.g. gated on some other signal deciding which unit currently
+  holds the shared compressor. Not a `supports:` key (these are meant to
+  change every tick, not be fixed at codegen time); defaults to
+  true/true (no veto) if never called. Only blocks *entering* a new
+  direction -- never the safety clamp, never continuing or correcting
+  whichever direction is already running.
 
 #### Lossnay example
 
@@ -1307,6 +1386,7 @@ Since ESPHome 2026.4.0, a native `mitsubishi_cn105` component (by [@crnjan](http
 | **Half-degree setpoint** (0.5°C steps)          |                         ✅                         |          ✅ (PR [#15919](https://github.com/esphome/esphome/pull/15919))          |
 | **HEAT_COOL / AUTO mode**                       |              ✅ Hybrid dual setpoint               | ✅ HEAT_COOL mapping (PR [#15748](https://github.com/esphome/esphome/pull/15748)) |
 | **Dual setpoint support**                       |   ✅ Native via `supports: dual_setpoint: true`    |                              ❌ Single setpoint only                              |
+| **Dual setpoint actuation**                     |  ✅ Native via `supports: dead_band_actuation: true` |                                  ❌ Not planned                                   |
 | **Vertical vane (swing) select**                |               ✅ 5 positions + SWING               |        ⏳ Draft PR [#15653](https://github.com/esphome/esphome/pull/15653)        |
 | **Horizontal vane (wide vane) select**          |             ✅ All 8 positions + SWING             |        ⏳ Draft PR [#15653](https://github.com/esphome/esphome/pull/15653)        |
 | **Dual/split vane support**                     | ✅ `vane_type: split_horizontal / split_vertical`  |                                  ❌ Not planned                                   |

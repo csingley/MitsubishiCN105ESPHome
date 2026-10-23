@@ -346,7 +346,7 @@ void HeatPumpProfile::apply_received_settings(heatpumpSettings& settings) {
 
 void HeatPumpProfile::reconcile_power_mode(heatpumpSettings& settings, bool updateCurrentSettings) {
     hp_.mode = HeatPumpProtocol::reconcile_power_mode(settings, hp_.currentSettings, hp_.mode,
-        hp_.supports_dual_setpoint_, updateCurrentSettings);
+        hp_.supports_dual_setpoint_, updateCurrentSettings, hp_.dead_band_owns_off_);
 }
 
 void HeatPumpProfile::checkVaneSettings(heatpumpSettings& settings, bool updateCurrentSettings) {
@@ -495,7 +495,11 @@ void HeatPumpProfile::apply_wanted_settings() {
 
     if ((hp_.wantedSettings.mode != nullptr) || (hp_.wantedSettings.power != nullptr)) {
         this->reconcile_power_mode(hp_.wantedSettings, false);
+        // Display only: this runs after the packet is built and right before
+        // wantedSettings are reset, so anything staged here would be lost.
+        hp_.suppress_dead_band_actuation_ = true;
         this->update_action();       // update action info on HA climate component
+        hp_.suppress_dead_band_actuation_ = false;
     }
 
     if (hp_.wantedSettings.fan != nullptr) {
@@ -543,9 +547,16 @@ void HeatPumpProfile::control_mode() {
         break;
 
     case climate::CLIMATE_MODE_HEAT_COOL:
-        ESP_LOGI("control", "changing mode to HEAT_COOL (hardware AUTO)");
-        hp_.setModeSetting("AUTO");
-        hp_.setPowerSetting("ON");
+        if (hp_.dead_band_enabled()) {
+            // The dead-band drives the wire directly; controlDelegate() runs it
+            // once the whole call is applied. Don't hand the wire to hardware
+            // AUTO's own changeover logic in the meantime.
+            ESP_LOGI("control", "changing mode to HEAT_COOL (dead-band)");
+        } else {
+            ESP_LOGI("control", "changing mode to HEAT_COOL (hardware AUTO)");
+            hp_.setModeSetting("AUTO");
+            hp_.setPowerSetting("ON");
+        }
         break;
 
     case climate::CLIMATE_MODE_AUTO:
@@ -648,6 +659,25 @@ void HeatPumpProfile::control_temperature() {
                 }
                 ESP_LOGI("control", "Initializing HEAT_COOL mode temps from current PAC temp: %.1f -> [%.1f - %.1f]",
                     hp_.currentSettings.temperature, hp_.getTargetTemperatureLow(), hp_.getTargetTemperatureHigh());
+            }
+            if (hp_.dead_band_enabled()) {
+                // The on-device dead-band (update_action()/stage_transition_())
+                // is the sole writer of wire temperature in this mode -- skip
+                // the legacy single-value deadband_setting() write entirely,
+                // don't just let the dead-band overwrite it afterward. If the
+                // dead-band's own decision is a no-op this cycle (HOLD_*,
+                // STAY_IDLE, blocked by dwell/hysteresis), this legacy write
+                // would otherwise still go out on its own, uncoordinated with
+                // any of that. That used to be harmless -- a temperature-only
+                // write has no effect while idling means power=OFF -- but the
+                // thermo-off redesign idles via power=ON, so this same write
+                // now has real, immediate effect: it bypassed dwell, the
+                // cross-zone allow_heat_/allow_cool_ veto, and started the
+                // compressor on its own. Caught live on real hardware
+                // (climate.minisplit_guest_rear), 2026-10-23 -- see
+                // docs/surveys/hardware-auto-mode.md.
+                ESP_LOGD("control", "HEAT_COOL dead-band active: skipping legacy deadband_setting() write");
+                return;
             }
             // In HEAT_COOL, use deadband to calculate 'setting'
             float current = hp_.getCurrentTemperature();
@@ -783,12 +813,79 @@ void HeatPumpProfile::control_swing() {
     }
 }
 
+bool HeatPumpProfile::stage_transition_(const char* mode, const char* power, float setpoint, uint32_t now_ms) {
+    if (hp_.suppress_dead_band_actuation_) return false;
+    if (mode != nullptr) hp_.setModeSetting(mode);
+    hp_.setPowerSetting(power);
+    if (!std::isnan(setpoint)) hp_.wantedSettings.temperature = hp_.calculateTemperatureSetting(setpoint);
+    hp_.last_dead_band_transition_ms_ = now_ms;
+    HeatPumpProtocol::mark_staged(hp_.wantedSettings, CUSTOM_MILLIS);
+    ESP_LOGI(TAG, "dead-band staged mode=%s power=%s setpoint=%.1f", mode ? mode : "-", power, setpoint);
+    return true;
+}
+
 void HeatPumpProfile::update_action() {
     ESP_LOGV(TAG, "updating action back to espHome...");
 
     if (cn105_traits_requires_two_point(hp_.traits())) {
         this->sanitize_setpoints();
     }
+
+    // Absolute safety clamp (supports.safety_floor_c/safety_ceiling_c) --
+    // never deferred, overrides everything below including an explicit
+    // OFF, checked before the #722 sub-mode override too. Still respects
+    // the same dwell guard as any other transition (the compressor
+    // doesn't care why a flip was requested). Decision math lives in
+    // HeatPumpProtocol::safety_clamp_decision() (heatpump_profile_protocol.h)
+    // as a pure function, same as deadband_setting() -- this just acts on it.
+    {
+        const uint32_t now_ms = millis();
+        const bool dwell_ok = hp_.min_dwell_s_ == 0 ||
+            (now_ms - hp_.last_dead_band_transition_ms_) >= hp_.min_dwell_s_ * 1000UL;
+        // Effective, not raw wire state -- see dead_band_idling_'s comment
+        // in cn105.h. Without this, a safety breach reached while the
+        // dead-band is merely idling a direction (thermo-off, wire still
+        // ON/HEAT or ON/COOL) would be misread as "already heating/cooling"
+        // and silently no-op (HOLD_HEATING/HOLD_COOLING) instead of forcing
+        // real heat/cool -- exactly the never-deferred guarantee this clamp
+        // exists to provide.
+        const bool already_heating = HeatPumpProtocol::compressor_running_as(hp_.currentSettings, "HEAT")
+            && !hp_.dead_band_idling_;
+        const bool already_cooling = HeatPumpProtocol::compressor_running_as(hp_.currentSettings, "COOL")
+            && !hp_.dead_band_idling_;
+
+        switch (HeatPumpProtocol::safety_clamp_decision(hp_.getCurrentTemperature(),
+                hp_.safety_floor_c_, hp_.safety_ceiling_c_, already_heating, already_cooling, dwell_ok)) {
+        case HeatPumpProtocol::SafetyClampAction::ENTER_HEAT:
+            // A couple of degrees of headroom, so the unit's own thermostat
+            // actually runs rather than idling right at the floor.
+            if (this->stage_transition_("HEAT", "ON", hp_.safety_floor_c_ + 2.0f, now_ms)) {
+                hp_.dead_band_owns_off_ = false;
+                hp_.dead_band_idling_ = false;
+            }
+            this->setActionIfOperatingTo(climate::CLIMATE_ACTION_HEATING);
+            return;
+        case HeatPumpProtocol::SafetyClampAction::HOLD_HEATING:
+            this->setActionIfOperatingTo(climate::CLIMATE_ACTION_HEATING);
+            return;
+        case HeatPumpProtocol::SafetyClampAction::ENTER_COOL:
+            if (this->stage_transition_("COOL", "ON", hp_.safety_ceiling_c_ - 2.0f, now_ms)) {
+                hp_.dead_band_owns_off_ = false;
+                hp_.dead_band_idling_ = false;
+            }
+            this->setActionIfOperatingTo(climate::CLIMATE_ACTION_COOLING);
+            return;
+        case HeatPumpProtocol::SafetyClampAction::HOLD_COOLING:
+            this->setActionIfOperatingTo(climate::CLIMATE_ACTION_COOLING);
+            return;
+        case HeatPumpProtocol::SafetyClampAction::HOLD_IDLE:
+            this->setActionIfOperatingTo(climate::CLIMATE_ACTION_IDLE);
+            return;
+        case HeatPumpProtocol::SafetyClampAction::NONE:
+            break;   // neither threshold breached (or unset) -- fall through
+        }
+    }
+
     // Keep the upstream #722 override in the payload profile, including legacy fallback.
     if (const auto sub_mode_action = cn105_climate::action_from_sub_mode(hp_.mode, hp_.currentSettings.sub_mode)) {
         hp_.action = *sub_mode_action;
@@ -803,15 +900,108 @@ void HeatPumpProfile::update_action() {
             this->setActionIfOperatingTo(climate::CLIMATE_ACTION_COOLING);
             break;
         case climate::CLIMATE_MODE_HEAT_COOL:
-            if (hp_.traits().supports_mode(climate::CLIMATE_MODE_HEAT) &&
+            if (!hp_.dead_band_enabled() &&
+                hp_.traits().supports_mode(climate::CLIMATE_MODE_HEAT) &&
                 hp_.traits().supports_mode(climate::CLIMATE_MODE_COOL)) {
-                // Logique Deadband pour HEAT_COOL
+                // Hardware AUTO drives the unit; display only.
                 if (hp_.getCurrentTemperature() >= hp_.getTargetTemperatureHigh()) {
                     this->setActionIfOperatingTo(climate::CLIMATE_ACTION_COOLING);
                 } else if (hp_.getCurrentTemperature() <= hp_.getTargetTemperatureLow()) {
                     this->setActionIfOperatingTo(climate::CLIMATE_ACTION_HEATING);
                 } else {
                     this->setActionIfOperatingTo(climate::CLIMATE_ACTION_IDLE);
+                }
+            } else if (hp_.traits().supports_mode(climate::CLIMATE_MODE_HEAT) &&
+                hp_.traits().supports_mode(climate::CLIMATE_MODE_COOL)) {
+                // Dead-band actuation. Drives the real wire mode directly
+                // (stage_transition_()) -- never through this->mode -- so
+                // this->mode stays HEAT_COOL for display the whole time
+                // band-governing is active; only the polled wire state
+                // (currentSettings) changes. Decision math lives in
+                // HeatPumpProtocol::dead_band_decision()
+                // (heatpump_profile_protocol.h) as a pure function, same as
+                // deadband_setting() -- this just acts on it. Runs on every
+                // status/settings change and on every ClimateCall in this
+                // mode (see controlDelegate()), not on a fixed poll.
+                //
+                // allow_heat_/allow_cool_ (default true) veto only ENTERING
+                // a new direction -- e.g. cross-zone arbitration on a
+                // shared compressor. Continuing or correcting whichever
+                // direction is already running is never vetoed, same as
+                // dwell: the external caller can only stop a flip from
+                // happening, never force one to stop early.
+                // Raw wire read -- used for foreign_running (is the unit
+                // running in a mode the dead-band doesn't drive at all,
+                // e.g. leftover hardware AUTO), which must not be confused
+                // with our own direction merely being idled.
+                const bool wire_heating = HeatPumpProtocol::compressor_running_as(hp_.currentSettings, "HEAT");
+                const bool wire_cooling = HeatPumpProtocol::compressor_running_as(hp_.currentSettings, "COOL");
+                const bool foreign_running = hp_.currentSettings.power != nullptr &&
+                    strcmp(hp_.currentSettings.power, "ON") == 0 && !wire_heating && !wire_cooling;
+                // Effective, not raw wire state, for the decision itself:
+                // while deliberately idling a direction via a satisfied
+                // setpoint (dead_band_idling_), wire power/mode still read
+                // ON/HEAT or ON/COOL, but the dead-band must treat that as
+                // idle -- not as "already heating" -- so it keeps comparing
+                // the real band edges against current temperature instead
+                // of deferring to a stale, fixed idle setpoint. See
+                // dead_band_idling_'s comment in cn105.h.
+                const bool heating = wire_heating && !hp_.dead_band_idling_;
+                const bool cooling = wire_cooling && !hp_.dead_band_idling_;
+                const uint32_t now_ms = millis();
+                const bool dwell_ok = hp_.min_dwell_s_ == 0 ||
+                    (now_ms - hp_.last_dead_band_transition_ms_) >= hp_.min_dwell_s_ * 1000UL;
+                const bool power_staged = hp_.wantedSettings.power != nullptr;
+
+                const auto action = HeatPumpProtocol::dead_band_decision(hp_.getCurrentTemperature(),
+                        hp_.getTargetTemperatureLow(), hp_.getTargetTemperatureHigh(),
+                        heating, cooling, dwell_ok, hp_.allow_heat_, hp_.allow_cool_, foreign_running,
+                        hp_.band_hysteresis_c_);
+                if (!hp_.suppress_dead_band_actuation_) {
+                    hp_.dead_band_owns_off_ = HeatPumpProtocol::dead_band_owns_off_after(
+                        hp_.dead_band_owns_off_, action, heating, cooling, foreign_running, power_staged,
+                        hp_.dead_band_idling_);
+                }
+                switch (action) {
+                case HeatPumpProtocol::DeadBandAction::ENTER_COOL:
+                    this->stage_transition_("COOL", "ON", HeatPumpProtocol::dead_band_entry_setpoint(false,
+                        hp_.getTargetTemperatureLow(), hp_.getTargetTemperatureHigh(), hp_.band_hysteresis_c_), now_ms);
+                    hp_.dead_band_idling_ = false;
+                    this->setActionIfOperatingTo(climate::CLIMATE_ACTION_COOLING);
+                    break;
+                case HeatPumpProtocol::DeadBandAction::HOLD_COOLING:
+                    this->setActionIfOperatingTo(climate::CLIMATE_ACTION_COOLING);
+                    break;
+                case HeatPumpProtocol::DeadBandAction::ENTER_HEAT:
+                    this->stage_transition_("HEAT", "ON", HeatPumpProtocol::dead_band_entry_setpoint(true,
+                        hp_.getTargetTemperatureLow(), hp_.getTargetTemperatureHigh(), hp_.band_hysteresis_c_), now_ms);
+                    hp_.dead_band_idling_ = false;
+                    this->setActionIfOperatingTo(climate::CLIMATE_ACTION_HEATING);
+                    break;
+                case HeatPumpProtocol::DeadBandAction::HOLD_HEATING:
+                    this->setActionIfOperatingTo(climate::CLIMATE_ACTION_HEATING);
+                    break;
+                case HeatPumpProtocol::DeadBandAction::STAY_IDLE:
+                    this->setActionIfOperatingTo(climate::CLIMATE_ACTION_IDLE);
+                    break;
+                case HeatPumpProtocol::DeadBandAction::GO_IDLE:
+                    if (heating || cooling) {
+                        // Known running direction: idle via a satisfied
+                        // setpoint instead of a power-off, so the unit
+                        // settles into its own native thermo-off rather
+                        // than a harder power-cycle.
+                        this->stage_transition_(nullptr, "ON", HeatPumpProtocol::dead_band_idle_setpoint(
+                            heating, hp_.getCurrentTemperature()), now_ms);
+                        hp_.dead_band_idling_ = true;
+                    } else {
+                        // No direction of ours was running (idling a
+                        // foreign hardware-AUTO leftover) -- no setpoint of
+                        // ours to anchor an idle state to, so fall back to
+                        // a real power-off.
+                        this->stage_transition_(nullptr, "OFF", NAN, now_ms);
+                    }
+                    this->setActionIfOperatingTo(climate::CLIMATE_ACTION_IDLE);
+                    break;
                 }
             } else {
                 this->setActionIfOperatingTo(climate::CLIMATE_ACTION_FAN);
@@ -988,8 +1178,22 @@ void HeatPumpProfile::restore_setpoints() {
         return;
     }
     // Preserve the restored HEAT_COOL band when hardware reports HEAT, COOL or AUTO.
-    // OFF and the other supported mode transitions are still reconciled normally.
+    // The other supported mode transitions are still reconciled normally. A
+    // power-off report is held too when the dead-band drives the wire: being
+    // idle at boot is the dead-band's normal state, not the user switching off.
     hp_.mode = climate::CLIMATE_MODE_HEAT_COOL;
+    hp_.dead_band_owns_off_ = hp_.dead_band_enabled();
+    // dead_band_idling_ is deliberately left at its default (false) here,
+    // not set from any saved state -- unlike dead_band_owns_off_ above, a
+    // wrong default self-corrects within the first post-boot decision
+    // cycle either way: booting into a genuine power-off (foreign/no known
+    // direction) never sets it since compressor_running_as() is false
+    // regardless; booting into a thermo-off-idle state (power=ON, wire
+    // still HEAT/COOL from before reboot) re-derives GO_IDLE on the first
+    // cycle (room still satisfied, dwell elapsed from a fresh boot) and
+    // sets it true then. No window exists where the wrong default would be
+    // read by resolve_mode(), since that only consults dead_band_owns_off_
+    // when power != ON -- unaffected by dead_band_idling_ either way.
     hp_.setTargetTemperatureLow(s.target_low);
     hp_.setTargetTemperatureHigh(s.target_high);
     ESP_LOGI("restore", "restore_setpoints: restored HEAT_COOL band low=%.1f high=%.1f", s.target_low, s.target_high);

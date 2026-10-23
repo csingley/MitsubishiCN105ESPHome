@@ -297,6 +297,30 @@ namespace esphome {
         // Opt-in (supports.restore_setpoints): persist HEAT_COOL band across reboots
         void set_restore_setpoints(bool v) { this->restore_setpoints_ = v; }
 
+        // Opt-in (supports.min_dwell_s): minimum dwell between dead-band-driven
+        // real mode/power transitions. 0 disables it (default).
+        void set_min_dwell_s(uint32_t v) { this->min_dwell_s_ = v; }
+
+        // Opt-in (supports.dead_band_actuation/band_hysteresis_c): drive
+        // HEAT_COOL with the on-device dead-band instead of hardware AUTO.
+        void set_dead_band_actuation(bool v) { this->dead_band_actuation_ = v; }
+        void set_band_hysteresis_c(float v) { this->band_hysteresis_c_ = v; }
+        bool dead_band_enabled() const {
+            return this->dead_band_actuation_ && cn105_traits_requires_two_point(this->traits_);
+        }
+
+        // Opt-in (supports.safety_floor_c/safety_ceiling_c): absolute freeze/
+        // overheat clamp, checked before anything else in update_action().
+        // NAN (default) disables each independently.
+        void set_safety_floor_c(float v) { this->safety_floor_c_ = v; }
+        void set_safety_ceiling_c(float v) { this->safety_ceiling_c_ = v; }
+
+        // Runtime veto on the HEAT_COOL dead-band entering heat/cool (see
+        // allow_heat_/allow_cool_ below) -- call every tick from a lambda,
+        // not a one-time YAML config value.
+        void set_allow_heat(bool v) { this->allow_heat_ = v; }
+        void set_allow_cool(bool v) { this->allow_cool_ = v; }
+
         // Configure the climate object with traits that we support.
 
 
@@ -531,5 +555,56 @@ namespace esphome {
         bool restore_setpoints_ = false;
         void restore_setpoint_state_();
         void save_setpoint_state_();
+
+        // The HEAT_COOL dead-band decided the unit should be off/idle, so a
+        // power-off report is its own doing and must not drop this->mode to
+        // OFF (see resolve_mode()'s hold_power_off). Cleared whenever the
+        // dead-band starts a direction, or the wire is seen running with
+        // nothing staged (i.e. someone else turned it on).
+        bool dead_band_owns_off_ = false;
+
+        // True while the dead-band is deliberately idling a known direction
+        // via a satisfied setpoint (GO_IDLE, thermo-off redesign) rather than
+        // actually driving it. Wire power/mode alone can't tell idling apart
+        // from actively heating/cooling once idle no longer means power=OFF,
+        // so dead_band_decision() is fed `compressor_running_as(...) &&
+        // !dead_band_idling_` instead of the raw wire read -- otherwise the
+        // dead-band would stop re-evaluating the real band edges altogether
+        // once idling, silently deferring to whatever fixed setpoint was
+        // staged at the moment it idled instead of the user's configured
+        // band. Cleared on ENTER_HEAT/ENTER_COOL (dead-band or safety clamp).
+        bool dead_band_idling_ = false;
+
+        // Set while update_action() runs inside the post-send path
+        // (apply_wanted_settings()), whose wantedSettings are wiped right
+        // after -- anything the dead-band staged there would be lost.
+        bool suppress_dead_band_actuation_ = false;
+
+        // Anti-short-cycle dwell for the HEAT_COOL dead-band actuation
+        // (supports.min_dwell_s; 0 = disabled). last_dead_band_transition_ms_
+        // is millis()-based (relative time only), same reasoning as every
+        // other timer in this component's control loop.
+        uint32_t min_dwell_s_ = 0;
+
+        // supports.dead_band_actuation (requires dual_setpoint). Off: HEAT_COOL
+        // is hardware AUTO and the action is display-only, as upstream.
+        bool dead_band_actuation_ = false;
+        float band_hysteresis_c_ = 0.0f;
+        uint32_t last_dead_band_transition_ms_ = 0;
+
+        // Absolute safety clamp (supports.safety_floor_c/safety_ceiling_c).
+        // NAN = disabled, independently per edge.
+        float safety_floor_c_ = NAN;
+        float safety_ceiling_c_ = NAN;
+
+        // External veto on the HEAT_COOL dead-band ENTERING a new direction
+        // (e.g. cross-zone arbitration on a shared compressor) -- never on
+        // the safety clamp, and never on continuing/correcting whichever
+        // direction is already running. Not a `supports:` key: these are
+        // meant to be flipped every tick from a lambda (id(hp).set_allow_heat(...)),
+        // not fixed at codegen time. Default true/true: no veto, same
+        // autonomous behavior as before this hook existed.
+        bool allow_heat_ = true;
+        bool allow_cool_ = true;
     };
 }

@@ -152,6 +152,29 @@ CONF_REPORT_WHEN_IDLE = "report_when_idle"
 # Support explicite du DUAL setpoint via YAML
 CONF_DUAL_SETPOINT = "dual_setpoint"
 CONF_RESTORE_SETPOINTS = "restore_setpoints"
+# Minimum dwell time (seconds) between dead-band-driven real mode/power
+# transitions -- anti-short-cycle protection for the compressor. Generic,
+# opt-in mechanism; 0 (default) disables it, matching today's behavior for
+# anyone who doesn't set it. The actual dwell time is installation policy,
+# not something this component should hardcode.
+CONF_MIN_DWELL_S = "min_dwell_s"
+# Absolute safety floor/ceiling (°C) -- freeze/overheat protection. Generic,
+# opt-in; unset (default) disables it. Checked before anything else in
+# update_action() and overrides everything, including an explicit OFF --
+# but still respects the same dwell guard above (the compressor doesn't
+# care why a flip was requested). Thresholds are installation/climate-
+# specific policy, not something to hardcode here.
+CONF_SAFETY_FLOOR_C = "safety_floor_c"
+CONF_SAFETY_CEILING_C = "safety_ceiling_c"
+# Opt-in: drive HEAT_COOL with the on-device dead-band (real HEAT/COOL/off
+# wire commands) instead of handing it to hardware AUTO. Requires
+# dual_setpoint. Off by default, so existing dual_setpoint configs keep the
+# hardware-AUTO behaviour.
+CONF_DEAD_BAND_ACTUATION = "dead_band_actuation"
+# Dead-band hysteresis (°C): once heating, keep going while within this of the
+# low edge (cooling: of the high edge). 0 (default) idles as soon as the room
+# is back inside the band; 0.5 is one extra step at the unit's 0.5 °C readings.
+CONF_BAND_HYSTERESIS_C = "band_hysteresis_c"
 
 DEFAULT_CLIMATE_MODES = ["AUTO", "COOL", "HEAT", "DRY", "FAN_ONLY", "HEAT_COOL"]
 DEFAULT_FAN_MODES = ["AUTO", "MIDDLE", "QUIET", "LOW", "MEDIUM", "HIGH"]
@@ -575,6 +598,11 @@ CONFIG_SCHEMA = (
                     ): cv.ensure_list(climate.validate_climate_swing_mode),
                     cv.Optional(CONF_DUAL_SETPOINT, default=False): cv.boolean,
                     cv.Optional(CONF_RESTORE_SETPOINTS, default=False): cv.boolean,
+                    cv.Optional(CONF_DEAD_BAND_ACTUATION, default=False): cv.boolean,
+                    cv.Optional(CONF_BAND_HYSTERESIS_C, default=0.0): cv.float_range(min=0.0),
+                    cv.Optional(CONF_MIN_DWELL_S, default=0): cv.positive_int,
+                    cv.Optional(CONF_SAFETY_FLOOR_C): cv.float_,
+                    cv.Optional(CONF_SAFETY_CEILING_C): cv.float_,
                     cv.Optional(CONF_SUPPORTS_HORIZONTAL_VANE_MODE): cv.ensure_list(
                         cv.string
                     ),
@@ -591,7 +619,16 @@ CONFIG_SCHEMA = (
     .extend(cv.COMPONENT_SCHEMA)
 )
 
-CONFIG_SCHEMA = cv.All(CONFIG_SCHEMA, validate_lossnay_config)
+def validate_dead_band_config(config):
+    supports = config.get(CONF_SUPPORTS, {})
+    if supports.get(CONF_DEAD_BAND_ACTUATION, False) and not supports.get(CONF_DUAL_SETPOINT, False):
+        raise cv.Invalid("dead_band_actuation requires dual_setpoint: true")
+    if supports.get(CONF_BAND_HYSTERESIS_C, 0.0) > 0 and not supports.get(CONF_DEAD_BAND_ACTUATION, False):
+        raise cv.Invalid("band_hysteresis_c requires dead_band_actuation: true")
+    return config
+
+
+CONFIG_SCHEMA = cv.All(CONFIG_SCHEMA, validate_lossnay_config, validate_dead_band_config)
 
 
 @coroutine
@@ -666,6 +703,17 @@ def to_code(config):
         # Opt-in: persist the HEAT_COOL band (mode + low/high) to flash and restore
         # it on boot, so a reboot/OTA doesn't drop the unit back to hardware AUTO.
         cg.add(var.set_restore_setpoints(supports.get(CONF_RESTORE_SETPOINTS, False)))
+        # Opt-in: anti-short-cycle dwell for dead-band-driven transitions.
+        cg.add(var.set_dead_band_actuation(supports.get(CONF_DEAD_BAND_ACTUATION, False)))
+        cg.add(var.set_band_hysteresis_c(supports.get(CONF_BAND_HYSTERESIS_C, 0.0)))
+        cg.add(var.set_min_dwell_s(supports.get(CONF_MIN_DWELL_S, 0)))
+        # Opt-in: absolute freeze/overheat safety clamp. Unset -> NAN -> disabled.
+        safety_floor = supports.get(CONF_SAFETY_FLOOR_C)
+        if safety_floor is not None:
+            cg.add(var.set_safety_floor_c(safety_floor))
+        safety_ceiling = supports.get(CONF_SAFETY_CEILING_C)
+        if safety_ceiling is not None:
+            cg.add(var.set_safety_ceiling_c(safety_ceiling))
         # ESPHome's default behavior for modes like COOL/HEAT is to enable single-point target temperature.
         # We don't need to explicitly force single-point or clear the dual flag (it's off by default).
 
